@@ -179,6 +179,10 @@ impl<'p> Command<'p, '_> {
             Type::CONEMU_XTERM_EMULATION => CommandType::ConemuXtermEmulation,
             Type::CONEMU_COMMENT => CommandType::ConemuComment,
             Type::KITTY_TEXT_SIZING => CommandType::KittyTextSizing,
+            Type::KITTY_CLIPBOARD_PROTOCOL => CommandType::KittyClipboardProtocol,
+            Type::KITTY_DND_PROTOCOL => CommandType::KittyDndProtocol,
+            Type::CONTEXT_SIGNAL => CommandType::ContextSignal,
+            Type::KITTY_DESKTOP_NOTIFICATION => CommandType::KittyDesktopNotification,
 
             _ => return None,
         })
@@ -199,7 +203,8 @@ impl<'p> Command<'p, '_> {
 }
 
 /// Type of an OSC command.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 #[expect(missing_docs, reason = "missing upstream docs")]
 pub enum CommandType<'p> {
     #[default]
@@ -236,6 +241,10 @@ pub enum CommandType<'p> {
     ConemuXtermEmulation,
     ConemuComment,
     KittyTextSizing,
+    KittyClipboardProtocol,
+    KittyDndProtocol,
+    ContextSignal,
+    KittyDesktopNotification,
 }
 
 /// How an OSC sequence was ended.
@@ -257,19 +266,50 @@ pub enum Terminator {
 mod tests {
     use super::*;
 
+    /// Parse the contents of one OSC sequence ended by `terminator`.
+    fn parse<'p>(parser: &'p mut Parser<'_>, osc: &[u8], terminator: u8) -> CommandType<'p> {
+        parser.reset();
+        for &byte in osc {
+            parser.next_byte(byte);
+        }
+        parser.end(terminator).command_type()
+    }
+
     #[test]
     fn window_title_is_extracted() {
         let mut parser = Parser::new().unwrap();
         // OSC 0 sets the title too.
         for (osc, expected) in [(b"2;hello".as_slice(), c"hello"), (b"0;other", c"other")] {
-            parser.reset();
-            for &byte in osc {
-                parser.next_byte(byte);
-            }
-            let CommandType::ChangeWindowTitle { title } = parser.end(0x07).command_type() else {
-                panic!("expected a window title command");
-            };
-            assert_eq!(title, expected);
+            assert_eq!(
+                parse(&mut parser, osc, 0x07),
+                CommandType::ChangeWindowTitle { title: expected }
+            );
+        }
+    }
+
+    #[test]
+    fn newer_protocol_commands_are_recognized() {
+        // Payloads taken from upstream's parser tests.
+        let mut parser = Parser::new().unwrap();
+        let cases: [(&[u8], CommandType<'_>); 4] = [
+            (
+                b"5522;type=read;dGV4dC9wbGFpbg==",
+                CommandType::KittyClipboardProtocol,
+            ),
+            (
+                b"72;t=a:i=5;text/plain text/uri-list",
+                CommandType::KittyDndProtocol,
+            ),
+            (b"3008;start=abc123", CommandType::ContextSignal),
+            (b"99;;bobr", CommandType::KittyDesktopNotification),
+        ];
+        for (osc, expected) in cases {
+            assert_eq!(
+                parse(&mut parser, osc, 0x07),
+                expected,
+                "{}",
+                String::from_utf8_lossy(osc)
+            );
         }
     }
 }
