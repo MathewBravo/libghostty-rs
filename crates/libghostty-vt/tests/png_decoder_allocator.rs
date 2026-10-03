@@ -16,6 +16,7 @@ use libghostty_vt::{
 /// passed in or with libghostty's default allocator.
 struct OnePixel {
     use_given_allocator: bool,
+    decode_on_drop: bool,
 }
 
 impl DecodePng for OnePixel {
@@ -35,6 +36,16 @@ impl DecodePng for OnePixel {
             height: 1,
             data,
         })
+    }
+}
+
+impl Drop for OnePixel {
+    fn drop(&mut self) {
+        if self.decode_on_drop {
+            // Destruction may use another terminal. The replacement decoder
+            // must already be callable without waiting for this drop to finish.
+            assert!(transmit_png().contains(";OK"));
+        }
     }
 }
 
@@ -61,21 +72,40 @@ fn transmit_png() -> String {
 
 #[test]
 fn decoded_images_must_use_the_given_allocator() {
-    graphics::set_png_decoder(Some(Box::new(OnePixel {
-        use_given_allocator: true,
-    })))
+    // SAFETY: This test binary has no other thread using libghostty.
+    unsafe {
+        graphics::set_png_decoder(Some(Box::new(OnePixel {
+            use_given_allocator: true,
+            decode_on_drop: true,
+        })))
+    }
     .unwrap();
     assert!(transmit_png().contains(";OK"));
 
+    // Replacing the decoder must allow its destructor to decode PNG input.
+    // SAFETY: As above.
+    unsafe {
+        graphics::set_png_decoder(Some(Box::new(OnePixel {
+            use_given_allocator: true,
+            decode_on_drop: false,
+        })))
+    }
+    .unwrap();
+
     // Freeing this buffer with the terminal's allocator would be a
     // cross-allocator free, so the image must be rejected instead.
-    graphics::set_png_decoder(Some(Box::new(OnePixel {
-        use_given_allocator: false,
-    })))
+    // SAFETY: As above.
+    unsafe {
+        graphics::set_png_decoder(Some(Box::new(OnePixel {
+            use_given_allocator: false,
+            decode_on_drop: false,
+        })))
+    }
     .unwrap();
     let reply = transmit_png();
     assert!(reply.contains("i=1;"), "no reply: {reply:?}");
     assert!(!reply.contains(";OK"), "image was accepted: {reply:?}");
 
-    graphics::set_png_decoder(None).unwrap();
+    // SAFETY: As above.
+    unsafe { graphics::set_png_decoder(None) }.unwrap();
 }
