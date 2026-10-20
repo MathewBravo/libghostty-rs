@@ -2215,6 +2215,130 @@ pub enum ProgressState {
     Pause = ffi::TerminalProgressState::PAUSE,
 }
 
+/// A shell integration event (OSC 133) reported by the running shell.
+///
+/// The terminal has already applied the event to its screen when the
+/// callback runs, so at [`SemanticPromptKind::PromptStart`] the cursor is
+/// on the row the prompt is being drawn on.
+#[derive(Debug, Copy, Clone)]
+pub struct SemanticPrompt<'t> {
+    ptr: *const ffi::TerminalSemanticPrompt,
+    _phan: PhantomData<&'t ()>,
+}
+
+impl<'t> SemanticPrompt<'t> {
+    unsafe fn from_raw(raw: *const ffi::TerminalSemanticPrompt) -> Self {
+        Self {
+            ptr: raw,
+            _phan: PhantomData,
+        }
+    }
+
+    /// Which step of the command this event reports.
+    ///
+    /// Later libghostty versions may report kinds this crate doesn't know
+    /// yet; those come back as [`Error::InvalidValue`] and are safe to
+    /// ignore.
+    pub fn kind(self) -> Result<SemanticPromptKind> {
+        // SAFETY: The event lives for the callback duration. `kind` has been
+        // present since the struct was introduced, so it needs no size check.
+        unsafe { *self.ptr }
+            .kind
+            .try_into()
+            .map_err(|_| Error::InvalidValue)
+    }
+
+    /// Which prompt is starting.
+    ///
+    /// Only meaningful for [`SemanticPromptKind::PromptStart`]; every other
+    /// kind reports [`SemanticPromptPromptKind::Primary`].
+    pub fn prompt_kind(self) -> Result<SemanticPromptPromptKind> {
+        // SAFETY: As for `kind`.
+        unsafe { *self.ptr }
+            .prompt_kind
+            .try_into()
+            .map_err(|_| Error::InvalidValue)
+    }
+
+    /// The command's exit code, for [`SemanticPromptKind::CommandEnd`] when
+    /// the shell sent one.
+    ///
+    /// This is an `Option` rather than a sentinel because exit codes can be
+    /// negative (on Windows, for example), so no `i32` value means "absent".
+    #[must_use]
+    pub fn exit_code(self) -> Option<i32> {
+        // SAFETY: As for `kind`.
+        let event = unsafe { *self.ptr };
+        event.has_exit_code.then_some(event.exit_code)
+    }
+
+    /// The decoded command line about to run, for
+    /// [`SemanticPromptKind::OutputStart`]. Empty when the shell didn't send
+    /// one or it couldn't be decoded.
+    ///
+    /// These are the shell's bytes after decoding, not necessarily UTF-8.
+    #[must_use]
+    pub fn command(self) -> &'t [u8] {
+        // SAFETY: The event and its strings live for the callback duration.
+        unsafe {
+            crate::sized_field!(self.ptr, ffi::TerminalSemanticPrompt, command)
+                .map_or(&[], |command| command.to_bytes())
+        }
+    }
+
+    /// A description of what went wrong, for
+    /// [`SemanticPromptKind::CommandEnd`] when the shell sent one. Empty
+    /// otherwise.
+    ///
+    /// Few shells send this; [`Self::exit_code`] is the usual signal. Like
+    /// the command line, these bytes are not guaranteed to be UTF-8.
+    #[must_use]
+    pub fn error(self) -> &'t [u8] {
+        // SAFETY: The event and its strings live for the callback duration.
+        unsafe {
+            crate::sized_field!(self.ptr, ffi::TerminalSemanticPrompt, error)
+                .map_or(&[], |error| error.to_bytes())
+        }
+    }
+}
+
+/// The step of a command that a [`SemanticPrompt`] reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, int_enum::IntEnum)]
+#[repr(i32)]
+#[non_exhaustive]
+pub enum SemanticPromptKind {
+    /// The shell started drawing a prompt (OSC 133;A).
+    /// [`SemanticPrompt::prompt_kind`] says which one.
+    PromptStart = ffi::SemanticPromptKind::GHOSTTY_SEMANTIC_PROMPT_PROMPT_START,
+    /// The prompt is drawn and the user can type (OSC 133;B).
+    InputStart = ffi::SemanticPromptKind::GHOSTTY_SEMANTIC_PROMPT_INPUT_START,
+    /// The user submitted the command and it started running (OSC 133;C).
+    OutputStart = ffi::SemanticPromptKind::GHOSTTY_SEMANTIC_PROMPT_OUTPUT_START,
+    /// The command finished running (OSC 133;D).
+    CommandEnd = ffi::SemanticPromptKind::GHOSTTY_SEMANTIC_PROMPT_COMMAND_END,
+}
+
+/// Which prompt a [`SemanticPromptKind::PromptStart`] event starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, int_enum::IntEnum)]
+#[repr(i32)]
+#[non_exhaustive]
+pub enum SemanticPromptPromptKind {
+    /// The main prompt shown before each command. Also used when the shell
+    /// doesn't say which prompt it is drawing.
+    Primary = ffi::SemanticPromptPromptKind::GHOSTTY_SEMANTIC_PROMPT_PROMPT_PRIMARY,
+    /// A prompt drawn at the right edge of the line, such as zsh's
+    /// `RPROMPT`.
+    Right = ffi::SemanticPromptPromptKind::GHOSTTY_SEMANTIC_PROMPT_PROMPT_RIGHT,
+    /// A prompt at the start of an extra line of a multi-line command.
+    Continuation = ffi::SemanticPromptPromptKind::GHOSTTY_SEMANTIC_PROMPT_PROMPT_CONTINUATION,
+    /// Another prompt for an extra line of input, such as bash's `PS2`.
+    ///
+    /// Shells differ in whether they report extra lines as continuation or
+    /// secondary prompts, so most applications should treat the two the
+    /// same.
+    Secondary = ffi::SemanticPromptPromptKind::GHOSTTY_SEMANTIC_PROMPT_PROMPT_SECONDARY,
+}
+
 //---------------------------------------
 // Callbacks
 //---------------------------------------
@@ -2787,6 +2911,29 @@ handlers! {
         to = <'t>ProgressReportFn(ProgressReport<'t>),
     ) |term, func| {
         func(term, unsafe { ProgressReport::from_raw(progress) });
+    }
+
+    /// Call the given function when the shell reports a step of a command
+    /// through shell integration (OSC 133): a prompt starts, input starts,
+    /// output starts, or the command ends.
+    ///
+    /// The terminal applies the event to its screen before calling this, so
+    /// the callback can read the cursor position (for example to
+    /// [track](Terminal::track_grid_ref) the row a prompt starts on).
+    ///
+    /// This is the only way to learn a command's exit code: the terminal
+    /// doesn't keep it once the callback returns.
+    pub fn on_semantic_prompt(
+        &mut self,
+        tag = SEMANTIC_PROMPT,
+        from = TerminalSemanticPromptFn(
+            event: *const ffi::TerminalSemanticPrompt
+        ),
+        to = <'t>SemanticPromptFn(SemanticPrompt<'t>),
+    ) |term, func| {
+        // SAFETY: The event is only borrowed for the callback duration,
+        // which `SemanticPrompt`'s lifetime enforces.
+        func(term, unsafe { SemanticPrompt::from_raw(event) });
     }
 }
 
@@ -3642,6 +3789,121 @@ mod tests {
                 (b"\xc3\x28".to_vec(), b"ok".to_vec()),
             ]
         );
+    }
+
+    /// What a semantic prompt callback observed about one event.
+    #[derive(Debug, PartialEq, Eq)]
+    struct SeenPrompt {
+        kind: Option<SemanticPromptKind>,
+        prompt_kind: Option<SemanticPromptPromptKind>,
+        exit_code: Option<i32>,
+        command: Vec<u8>,
+        error: Vec<u8>,
+    }
+
+    impl SeenPrompt {
+        fn new(kind: SemanticPromptKind) -> Self {
+            Self {
+                kind: Some(kind),
+                prompt_kind: Some(SemanticPromptPromptKind::Primary),
+                exit_code: None,
+                command: Vec::new(),
+                error: Vec::new(),
+            }
+        }
+    }
+
+    /// Feed `input` to a fresh terminal and return every semantic prompt
+    /// event it reported, copied out so the assertions run outside the
+    /// callback (see `clipboard_read`).
+    fn semantic_prompts(input: &[u8]) -> Vec<SeenPrompt> {
+        let seen = RefCell::new(Vec::new());
+        let mut terminal = Terminal::new(80, 24).expect("terminal should initialize");
+        terminal
+            .on_semantic_prompt(|_term, event| {
+                seen.borrow_mut().push(SeenPrompt {
+                    kind: event.kind().ok(),
+                    prompt_kind: event.prompt_kind().ok(),
+                    exit_code: event.exit_code(),
+                    command: event.command().to_vec(),
+                    error: event.error().to_vec(),
+                });
+            })
+            .expect("callback should register");
+        terminal.vt_write(input);
+        drop(terminal);
+        seen.into_inner()
+    }
+
+    #[test]
+    fn semantic_prompt_reports_a_primary_prompt_start() {
+        assert_eq!(
+            semantic_prompts(b"\x1b]133;A\x07"),
+            [SeenPrompt::new(SemanticPromptKind::PromptStart)]
+        );
+    }
+
+    #[test]
+    fn semantic_prompt_reports_which_prompt_starts() {
+        assert_eq!(
+            semantic_prompts(b"\x1b]133;A;k=c\x07"),
+            [SeenPrompt {
+                prompt_kind: Some(SemanticPromptPromptKind::Continuation),
+                ..SeenPrompt::new(SemanticPromptKind::PromptStart)
+            }]
+        );
+    }
+
+    #[test]
+    fn semantic_prompt_decodes_the_command_line() {
+        assert_eq!(
+            semantic_prompts(b"\x1b]133;C;cmdline_url=ls%20-la\x07"),
+            [SeenPrompt {
+                command: b"ls -la".to_vec(),
+                ..SeenPrompt::new(SemanticPromptKind::OutputStart)
+            }]
+        );
+    }
+
+    /// Exit codes can be negative, which is why `exit_code` is an `Option`
+    /// and not a sentinel.
+    #[test]
+    fn semantic_prompt_reports_exit_code_and_error() {
+        assert_eq!(
+            semantic_prompts(b"\x1b]133;D;-1;err=boom\x07"),
+            [SeenPrompt {
+                exit_code: Some(-1),
+                error: b"boom".to_vec(),
+                ..SeenPrompt::new(SemanticPromptKind::CommandEnd)
+            }]
+        );
+    }
+
+    #[test]
+    fn semantic_prompt_command_end_without_exit_code() {
+        assert_eq!(
+            semantic_prompts(b"\x1b]133;D\x07"),
+            [SeenPrompt::new(SemanticPromptKind::CommandEnd)]
+        );
+    }
+
+    /// The callback runs after the terminal has applied the event, so at a
+    /// prompt start the cursor is already on the prompt's row. That is what
+    /// lets an embedder anchor per-command state to the row.
+    #[test]
+    fn semantic_prompt_sees_the_cursor_on_the_prompt_row() {
+        let rows = RefCell::new(Vec::new());
+        let mut terminal = Terminal::new(80, 24).expect("terminal should initialize");
+        terminal
+            .on_semantic_prompt(|term, event| {
+                if matches!(event.kind(), Ok(SemanticPromptKind::PromptStart)) {
+                    rows.borrow_mut().push(term.cursor_y().ok());
+                }
+            })
+            .expect("callback should register");
+        terminal.vt_write(b"one\r\ntwo\r\n\x1b]133;A\x07$ ");
+        drop(terminal);
+        assert_eq!(rows.into_inner(), [Some(2)]);
     }
 
     fn tiny_terminal() -> Terminal<'static, 'static> {
